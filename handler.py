@@ -1,176 +1,105 @@
 """
-BharatLLM — RunPod Serverless Handler
-Dynamic LoRA adapter loading for 13 models on a single endpoint.
-
-Base model: Mistral-7B-Instruct-v0.3 (loaded once at cold start)
-LoRA adapters: Downloaded from HuggingFace on first request, cached.
-
-Request format:
-{
-    "input": {
-        "prompt": "What is photosynthesis?",
-        "model": "hindi",
-        "max_tokens": 512,
-        "temperature": 0.7
-    }
-}
-
-Response format:
-{
-    "output": {
-        "text": "Photosynthesis is...",
-        "model": "bharat-hindi-7b-lora",
-        "tokens": 142,
-        "latency_ms": 1230
-    }
-}
+BharatLLM RunPod Serverless Worker — Simplified (float16, no bitsandbytes)
 """
-
 import os
 import time
-import torch
 import runpod
-from threading import Lock
-
-# ============================================================
-# Configuration
-# ============================================================
 
 HF_ORG = os.environ.get("HF_ORG", "FoundryAILabs")
 BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-MAX_SEQ_LENGTH = 2048
-CACHE_DIR = "/workspace/model_cache"
+CACHE_DIR = os.environ.get("HF_HOME", "/runpod-volume/model_cache")
 
-# Model registry: request name -> HuggingFace repo
 MODEL_REGISTRY = {
-    "english":   f"{HF_ORG}/bharat-english-7b-lora",
-    "hindi":     f"{HF_ORG}/bharat-hindi-7b-lora",
-    "bengali":   f"{HF_ORG}/bharat-bengali-7b-lora",
-    "telugu":    f"{HF_ORG}/bharat-telugu-7b-lora",
-    "tamil":     f"{HF_ORG}/bharat-tamil-7b-lora",
-    "kannada":   f"{HF_ORG}/bharat-kannada-7b-lora",
+    "english": f"{HF_ORG}/bharat-english-7b-lora",
+    "hindi": f"{HF_ORG}/bharat-hindi-7b-lora",
+    "bengali": f"{HF_ORG}/bharat-bengali-7b-lora",
+    "telugu": f"{HF_ORG}/bharat-telugu-7b-lora",
+    "tamil": f"{HF_ORG}/bharat-tamil-7b-lora",
+    "kannada": f"{HF_ORG}/bharat-kannada-7b-lora",
     "malayalam": f"{HF_ORG}/bharat-malayalam-7b-lora",
-    "marathi":   f"{HF_ORG}/bharat-marathi-7b-lora",
-    "gujarati":  f"{HF_ORG}/bharat-gujarati-7b-lora",
-    "odia":      f"{HF_ORG}/bharat-odia-7b-lora",
-    "punjabi":   f"{HF_ORG}/bharat-punjabi-7b-lora",
-    "urdu":      f"{HF_ORG}/bharat-urdu-7b-lora",
-    "btech":     f"{HF_ORG}/bharat-btech-7b-lora",
+    "marathi": f"{HF_ORG}/bharat-marathi-7b-lora",
+    "gujarati": f"{HF_ORG}/bharat-gujarati-7b-lora",
+    "odia": f"{HF_ORG}/bharat-odia-7b-lora",
+    "punjabi": f"{HF_ORG}/bharat-punjabi-7b-lora",
+    "urdu": f"{HF_ORG}/bharat-urdu-7b-lora",
+    "btech": f"{HF_ORG}/bharat-btech-7b-lora",
 }
-
-# ============================================================
-# Global State
-# ============================================================
 
 base_model = None
 base_tokenizer = None
-loaded_adapters = {}
-adapter_lock = Lock()
+current_adapter_name = None
+current_model = None
 
+print("=" * 50)
+print("  BharatLLM RunPod Worker Starting...")
+print(f"  Models: {len(MODEL_REGISTRY)}")
+print(f"  Cache: {CACHE_DIR}")
+print("=" * 50)
 
-def load_base_model():
-    """Load Mistral-7B base model at cold start."""
-    global base_model, base_tokenizer
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
 
-    print(f"[INIT] Loading base model: {BASE_MODEL}")
-    start = time.time()
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-
+    print(f"[INIT] Loading tokenizer: {BASE_MODEL}")
     base_tokenizer = AutoTokenizer.from_pretrained(
-        BASE_MODEL,
-        cache_dir=CACHE_DIR,
-        trust_remote_code=True,
+        BASE_MODEL, cache_dir=CACHE_DIR, trust_remote_code=True
     )
     if base_tokenizer.pad_token is None:
         base_tokenizer.pad_token = base_tokenizer.eos_token
 
+    print(f"[INIT] Loading base model (float16)...")
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
-        quantization_config=bnb_config,
+        torch_dtype=torch.float16,
         device_map="auto",
         cache_dir=CACHE_DIR,
         trust_remote_code=True,
     )
+    print(f"[INIT] Base model loaded! GPU: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
 
-    elapsed = time.time() - start
-    print(f"[INIT] Base model loaded in {elapsed:.1f}s")
-    print(f"[INIT] GPU memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
+except Exception as e:
+    print(f"[INIT ERROR] {e}")
+    import traceback
+    traceback.print_exc()
 
-
-def get_adapter(model_name):
-    """Load or retrieve cached LoRA adapter."""
-    global base_model
-
-    if model_name in loaded_adapters:
-        return loaded_adapters[model_name]
-
-    with adapter_lock:
-        if model_name in loaded_adapters:
-            return loaded_adapters[model_name]
-
-        repo_id = MODEL_REGISTRY.get(model_name)
-        if not repo_id:
-            raise ValueError(f"Unknown model: {model_name}. Available: {list(MODEL_REGISTRY.keys())}")
-
-        print(f"[ADAPTER] Loading {model_name} from {repo_id}...")
-        start = time.time()
-
-        from peft import PeftModel
-
-        adapter_model = PeftModel.from_pretrained(
-            base_model,
-            repo_id,
-            cache_dir=CACHE_DIR,
-        )
-        adapter_model.eval()
-
-        elapsed = time.time() - start
-        print(f"[ADAPTER] {model_name} loaded in {elapsed:.1f}s")
-
-        # Keep max 3 adapters in memory
-        if len(loaded_adapters) >= 3:
-            oldest_key = next(iter(loaded_adapters))
-            del loaded_adapters[oldest_key]
-            torch.cuda.empty_cache()
-            print(f"[ADAPTER] Evicted {oldest_key} from cache")
-
-        loaded_adapters[model_name] = adapter_model
-        return adapter_model
-
-
-# ============================================================
-# Handler
-# ============================================================
 
 def handler(job):
-    """Process a single inference request."""
-    job_input = job["input"]
-
-    prompt = job_input.get("prompt", "")
-    model_name = job_input.get("model", "english")
-    max_tokens = min(job_input.get("max_tokens", 512), 2048)
-    temperature = job_input.get("temperature", 0.7)
-    mode = job_input.get("mode", "k12")
-
-    if mode == "btech":
-        model_name = "btech"
-
-    if not prompt:
-        return {"error": "No prompt provided"}
-
-    start_time = time.time()
+    global current_adapter_name, current_model
 
     try:
-        model = get_adapter(model_name)
+        job_input = job["input"]
+        prompt = job_input.get("prompt", "")
+        model_name = job_input.get("model", "english")
+        max_tokens = min(job_input.get("max_tokens", 512), 2048)
+        temperature = job_input.get("temperature", 0.7)
+        mode = job_input.get("mode", "k12")
 
+        if mode == "btech":
+            model_name = "btech"
+
+        if not prompt:
+            return {"error": "No prompt provided"}
+
+        start_time = time.time()
+
+        # Load adapter if different from current
+        if model_name != current_adapter_name:
+            repo_id = MODEL_REGISTRY.get(model_name)
+            if not repo_id:
+                return {"error": f"Unknown model: {model_name}"}
+
+            print(f"[ADAPTER] Loading {model_name} from {repo_id}")
+            current_model = PeftModel.from_pretrained(
+                base_model, repo_id, cache_dir=CACHE_DIR
+            )
+            current_model.eval()
+            current_adapter_name = model_name
+            print(f"[ADAPTER] {model_name} loaded!")
+
+        # Format prompt
         if model_name == "btech":
             system = job_input.get("system", "You are BharatLLM, an expert engineering tutor.")
             formatted = f"[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{prompt} [/INST]"
@@ -178,14 +107,11 @@ def handler(job):
             formatted = f"[INST] {prompt} [/INST]"
 
         inputs = base_tokenizer(
-            formatted,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-        ).to(model.device)
+            formatted, return_tensors="pt", truncation=True, max_length=2048
+        ).to(current_model.device)
 
         with torch.no_grad():
-            outputs = model.generate(
+            outputs = current_model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 temperature=temperature if temperature > 0 else None,
@@ -195,40 +121,21 @@ def handler(job):
                 pad_token_id=base_tokenizer.eos_token_id,
             )
 
-        input_length = inputs["input_ids"].shape[1]
-        generated_tokens = outputs[0][input_length:]
-        text = base_tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        token_count = len(generated_tokens)
-
-        latency_ms = int((time.time() - start_time) * 1000)
+        input_len = inputs["input_ids"].shape[1]
+        text = base_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+        latency = int((time.time() - start_time) * 1000)
 
         return {
             "text": text.strip(),
             "model": f"bharat-{model_name}-7b-lora",
-            "tokens": token_count,
-            "latency_ms": latency_ms,
-            "cached": model_name in loaded_adapters,
+            "tokens": len(outputs[0]) - input_len,
+            "latency_ms": latency,
         }
 
     except Exception as e:
-        latency_ms = int((time.time() - start_time) * 1000)
-        return {
-            "error": str(e),
-            "model": model_name,
-            "latency_ms": latency_ms,
-        }
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
-
-# ============================================================
-# Initialize and Start
-# ============================================================
-
-print("=" * 55)
-print("  BharatLLM RunPod Serverless Worker")
-print(f"  Models: {len(MODEL_REGISTRY)} (12 K-12 + 1 BTech)")
-print(f"  Base: {BASE_MODEL}")
-print("=" * 55)
-
-load_base_model()
 
 runpod.serverless.start({"handler": handler})
