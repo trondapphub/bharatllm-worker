@@ -1,5 +1,5 @@
 """
-BharatLLM RunPod Serverless Worker — Simplified (float16, no bitsandbytes)
+BharatLLM RunPod Serverless Worker — v4 (lazy loading, robust)
 """
 import os
 import time
@@ -7,7 +7,28 @@ import runpod
 
 HF_ORG = os.environ.get("HF_ORG", "FoundryAILabs")
 BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-CACHE_DIR = os.environ.get("HF_HOME", "/runpod-volume/model_cache")
+
+# Try multiple cache locations
+for cache_dir in ["/runpod-volume/model_cache", "/workspace/model_cache", "/tmp/model_cache"]:
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        # Test write
+        test_file = os.path.join(cache_dir, ".test")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.remove(test_file)
+        CACHE_DIR = cache_dir
+        break
+    except Exception:
+        continue
+else:
+    CACHE_DIR = "/tmp/model_cache"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
+
+print(f"[INIT] Cache dir: {CACHE_DIR}")
 
 MODEL_REGISTRY = {
     "english": f"{HF_ORG}/bharat-english-7b-lora",
@@ -25,111 +46,116 @@ MODEL_REGISTRY = {
     "btech": f"{HF_ORG}/bharat-btech-7b-lora",
 }
 
-base_model = None
-base_tokenizer = None
-current_adapter_name = None
-current_model = None
+# Lazy-loaded globals
+_model = None
+_tokenizer = None
+_adapter_name = None
+_adapter_model = None
 
-print("=" * 50)
-print("  BharatLLM RunPod Worker Starting...")
-print(f"  Models: {len(MODEL_REGISTRY)}")
-print(f"  Cache: {CACHE_DIR}")
-print("=" * 50)
 
-try:
+def get_model_and_tokenizer():
+    """Lazy-load base model on first request (not at startup)."""
+    global _model, _tokenizer
+    if _model is not None:
+        return _model, _tokenizer
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    print(f"[MODEL] Loading {BASE_MODEL} (float16)...")
+    start = time.time()
 
-    print(f"[INIT] Loading tokenizer: {BASE_MODEL}")
-    base_tokenizer = AutoTokenizer.from_pretrained(
+    _tokenizer = AutoTokenizer.from_pretrained(
         BASE_MODEL, cache_dir=CACHE_DIR, trust_remote_code=True
     )
-    if base_tokenizer.pad_token is None:
-        base_tokenizer.pad_token = base_tokenizer.eos_token
+    if _tokenizer.pad_token is None:
+        _tokenizer.pad_token = _tokenizer.eos_token
 
-    print(f"[INIT] Loading base model (float16)...")
-    base_model = AutoModelForCausalLM.from_pretrained(
+    _model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         torch_dtype=torch.float16,
         device_map="auto",
         cache_dir=CACHE_DIR,
         trust_remote_code=True,
     )
-    print(f"[INIT] Base model loaded! GPU: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
 
-except Exception as e:
-    print(f"[INIT ERROR] {e}")
-    import traceback
-    traceback.print_exc()
+    elapsed = time.time() - start
+    mem = torch.cuda.memory_allocated() / 1024**3
+    print(f"[MODEL] Loaded in {elapsed:.1f}s, GPU: {mem:.1f}GB")
+    return _model, _tokenizer
+
+
+def get_adapter(model_name):
+    """Load LoRA adapter (cached)."""
+    global _adapter_name, _adapter_model
+    if model_name == _adapter_name and _adapter_model is not None:
+        return _adapter_model
+
+    from peft import PeftModel
+
+    base, _ = get_model_and_tokenizer()
+    repo = MODEL_REGISTRY.get(model_name)
+    if not repo:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    print(f"[ADAPTER] Loading {model_name} from {repo}")
+    start = time.time()
+    _adapter_model = PeftModel.from_pretrained(base, repo, cache_dir=CACHE_DIR)
+    _adapter_model.eval()
+    _adapter_name = model_name
+    print(f"[ADAPTER] {model_name} loaded in {time.time()-start:.1f}s")
+    return _adapter_model
 
 
 def handler(job):
-    global current_adapter_name, current_model
-
+    """Process inference request."""
     try:
-        job_input = job["input"]
-        prompt = job_input.get("prompt", "")
-        model_name = job_input.get("model", "english")
-        max_tokens = min(job_input.get("max_tokens", 512), 2048)
-        temperature = job_input.get("temperature", 0.7)
-        mode = job_input.get("mode", "k12")
+        inp = job["input"]
+        prompt = inp.get("prompt", "")
+        model_name = inp.get("model", "english")
+        max_tokens = min(inp.get("max_tokens", 512), 2048)
+        temperature = inp.get("temperature", 0.7)
 
-        if mode == "btech":
+        if inp.get("mode") == "btech":
             model_name = "btech"
 
         if not prompt:
             return {"error": "No prompt provided"}
 
-        start_time = time.time()
+        import torch
 
-        # Load adapter if different from current
-        if model_name != current_adapter_name:
-            repo_id = MODEL_REGISTRY.get(model_name)
-            if not repo_id:
-                return {"error": f"Unknown model: {model_name}"}
+        start = time.time()
+        _, tokenizer = get_model_and_tokenizer()
+        model = get_adapter(model_name)
 
-            print(f"[ADAPTER] Loading {model_name} from {repo_id}")
-            current_model = PeftModel.from_pretrained(
-                base_model, repo_id, cache_dir=CACHE_DIR
-            )
-            current_model.eval()
-            current_adapter_name = model_name
-            print(f"[ADAPTER] {model_name} loaded!")
-
-        # Format prompt
         if model_name == "btech":
-            system = job_input.get("system", "You are BharatLLM, an expert engineering tutor.")
-            formatted = f"[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{prompt} [/INST]"
+            sys_msg = inp.get("system", "You are BharatLLM, an expert engineering tutor.")
+            formatted = f"[INST] <<SYS>>\n{sys_msg}\n<</SYS>>\n\n{prompt} [/INST]"
         else:
             formatted = f"[INST] {prompt} [/INST]"
 
-        inputs = base_tokenizer(
-            formatted, return_tensors="pt", truncation=True, max_length=2048
-        ).to(current_model.device)
+        inputs = tokenizer(formatted, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            outputs = current_model.generate(
+            out = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 temperature=temperature if temperature > 0 else None,
                 do_sample=temperature > 0,
                 top_p=0.9 if temperature > 0 else None,
                 repetition_penalty=1.1,
-                pad_token_id=base_tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
             )
 
         input_len = inputs["input_ids"].shape[1]
-        text = base_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-        latency = int((time.time() - start_time) * 1000)
+        text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
 
         return {
             "text": text.strip(),
             "model": f"bharat-{model_name}-7b-lora",
-            "tokens": len(outputs[0]) - input_len,
-            "latency_ms": latency,
+            "tokens": len(out[0]) - input_len,
+            "latency_ms": int((time.time() - start) * 1000),
         }
 
     except Exception as e:
@@ -137,5 +163,11 @@ def handler(job):
         traceback.print_exc()
         return {"error": str(e)}
 
+
+print("=" * 50)
+print("  BharatLLM Worker Ready (lazy loading)")
+print(f"  Models: {len(MODEL_REGISTRY)}")
+print(f"  Cache: {CACHE_DIR}")
+print("=" * 50)
 
 runpod.serverless.start({"handler": handler})
